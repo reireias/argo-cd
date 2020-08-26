@@ -18,8 +18,6 @@ steps:
         from_secret: docker_password
 
 trigger:
-  branch:
-    - master
   event:
     - tag
 
@@ -46,8 +44,6 @@ steps:
         from_secret: docker_password
 
 trigger:
-  branch:
-    - master
   event:
     - tag
 
@@ -74,8 +70,6 @@ steps:
         from_secret: docker_password
 
 trigger:
-  branch:
-    - master
   event:
     - tag
 
@@ -100,8 +94,6 @@ steps:
         - linux/arm64
 
 trigger:
-  branch:
-    - master
   event:
     - tag
 
