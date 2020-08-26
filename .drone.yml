@@ -7,15 +7,21 @@ platform:
   os: linux
 
 steps:
-- name: publish
-  image: plugins/docker
-  settings:
-    repo: reireias/argocd
-    tags: linux-amd64-${DRONE_BRANCH}
-    username:
-      from_secret: docker_username
-    password:
-      from_secret: docker_password
+  - name: publish
+    image: plugins/docker
+    settings:
+      repo: reireias/argocd
+      tags: linux-amd64-${DRONE_TAG}
+      username:
+        from_secret: docker_username
+      password:
+        from_secret: docker_password
+
+trigger:
+  branch:
+    - master
+  event:
+    - tag
 
 ---
 kind: pipeline
@@ -27,17 +33,23 @@ platform:
   os: linux
 
 steps:
-- name: publish
-  image: plugins/docker
-  settings:
-    repo: reireias/argocd
-    tags: linux-arm64-${DRONE_BRANCH}
-    build_args:
-      - BUILD_ALL_CLIS="false"
-    username:
-      from_secret: docker_username
-    password:
-      from_secret: docker_password
+  - name: publish
+    image: plugins/docker
+    settings:
+      repo: reireias/argocd
+      tags: linux-arm64-${DRONE_TAG}
+      build_args:
+        - BUILD_ALL_CLIS="false"
+      username:
+        from_secret: docker_username
+      password:
+        from_secret: docker_password
+
+trigger:
+  branch:
+    - master
+  event:
+    - tag
 
 ---
 kind: pipeline
@@ -49,17 +61,23 @@ platform:
   os: linux
 
 steps:
-- name: publish
-  image: plugins/docker
-  settings:
-    repo: reireias/argocd
-    tags: linux-arm-${DRONE_BRANCH}
-    build_args:
-      - BUILD_ALL_CLIS="false"
-    username:
-      from_secret: docker_username
-    password:
-      from_secret: docker_password
+  - name: publish
+    image: plugins/docker
+    settings:
+      repo: reireias/argocd
+      tags: linux-arm-${DRONE_TAG}
+      build_args:
+        - BUILD_ALL_CLIS="false"
+      username:
+        from_secret: docker_username
+      password:
+        from_secret: docker_password
+
+trigger:
+  branch:
+    - master
+  event:
+    - tag
 
 ---
 kind: pipeline
@@ -67,21 +85,27 @@ type: docker
 name: manifest
 
 steps:
-- name: publish
-  image: plugins/manifest
-  settings:
-    username:
-      from_secret: docker_username
-    password:
-      from_secret: docker_password
-    target: reireias/argocd:${DRONE_BRANCH}
-    template: reireias/argocd:OS-ARCH-${DRONE_BRANCH}
-    platforms:
-      - linux/amd64
-      - linux/arm
-      - linux/arm64
+  - name: publish
+    image: plugins/manifest
+    settings:
+      username:
+        from_secret: docker_username
+      password:
+        from_secret: docker_password
+      target: reireias/argocd:${DRONE_TAG}
+      template: reireias/argocd:OS-ARCH-${DRONE_TAG}
+      platforms:
+        - linux/amd64
+        - linux/arm
+        - linux/arm64
+
+trigger:
+  branch:
+    - master
+  event:
+    - tag
 
 depends_on:
-- linux-arm64
-- linux-arm
-- linux-amd64
+  - linux-arm64
+  - linux-arm
+  - linux-amd64
