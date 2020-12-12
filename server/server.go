@@ -16,12 +16,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/argoproj/gitops-engine/pkg/utils/errors"
-	"github.com/argoproj/gitops-engine/pkg/utils/io"
-	"github.com/argoproj/gitops-engine/pkg/utils/kube"
-	jwt "github.com/dgrijalva/jwt-go"
-	"github.com/go-redis/redis"
+	// nolint:staticcheck
 	golang_proto "github.com/golang/protobuf/proto"
+
+	"github.com/argoproj/pkg/jwt/zjwt"
+	"github.com/argoproj/pkg/sync"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/go-redis/redis/v8"
+	"github.com/gorilla/handlers"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
 	grpc_logrus "github.com/grpc-ecosystem/go-grpc-middleware/logging/logrus"
@@ -37,18 +39,13 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
-	yaml "gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v2"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
-
-	cacheutil "github.com/argoproj/argo-cd/util/cache"
-	"github.com/argoproj/argo-cd/util/healthz"
-	"github.com/argoproj/argo-cd/util/swagger"
-	"github.com/argoproj/argo-cd/util/webhook"
 
 	"github.com/argoproj/argo-cd/common"
 	"github.com/argoproj/argo-cd/pkg/apiclient"
@@ -68,6 +65,7 @@ import (
 	appinformer "github.com/argoproj/argo-cd/pkg/client/informers/externalversions"
 	applisters "github.com/argoproj/argo-cd/pkg/client/listers/application/v1alpha1"
 	repoapiclient "github.com/argoproj/argo-cd/reposerver/apiclient"
+	repocache "github.com/argoproj/argo-cd/reposerver/cache"
 	"github.com/argoproj/argo-cd/server/account"
 	"github.com/argoproj/argo-cd/server/application"
 	"github.com/argoproj/argo-cd/server/badge"
@@ -75,6 +73,7 @@ import (
 	"github.com/argoproj/argo-cd/server/certificate"
 	"github.com/argoproj/argo-cd/server/cluster"
 	"github.com/argoproj/argo-cd/server/gpgkey"
+	"github.com/argoproj/argo-cd/server/logout"
 	"github.com/argoproj/argo-cd/server/metrics"
 	"github.com/argoproj/argo-cd/server/project"
 	"github.com/argoproj/argo-cd/server/rbacpolicy"
@@ -83,25 +82,29 @@ import (
 	"github.com/argoproj/argo-cd/server/session"
 	"github.com/argoproj/argo-cd/server/settings"
 	"github.com/argoproj/argo-cd/server/version"
-	"github.com/argoproj/argo-cd/util"
 	"github.com/argoproj/argo-cd/util/assets"
+	cacheutil "github.com/argoproj/argo-cd/util/cache"
 	"github.com/argoproj/argo-cd/util/db"
 	"github.com/argoproj/argo-cd/util/dex"
 	dexutil "github.com/argoproj/argo-cd/util/dex"
 	"github.com/argoproj/argo-cd/util/env"
+	"github.com/argoproj/argo-cd/util/errors"
 	grpc_util "github.com/argoproj/argo-cd/util/grpc"
+	"github.com/argoproj/argo-cd/util/healthz"
 	httputil "github.com/argoproj/argo-cd/util/http"
-	"github.com/argoproj/argo-cd/util/jwt/zjwt"
+	"github.com/argoproj/argo-cd/util/io"
+	kubeutil "github.com/argoproj/argo-cd/util/kube"
 	"github.com/argoproj/argo-cd/util/oidc"
 	"github.com/argoproj/argo-cd/util/rbac"
 	util_session "github.com/argoproj/argo-cd/util/session"
 	settings_util "github.com/argoproj/argo-cd/util/settings"
+	"github.com/argoproj/argo-cd/util/swagger"
 	tlsutil "github.com/argoproj/argo-cd/util/tls"
+	"github.com/argoproj/argo-cd/util/webhook"
 )
 
 const maxConcurrentLoginRequestsCountEnv = "ARGOCD_MAX_CONCURRENT_LOGIN_REQUESTS_COUNT"
 const replicasCountEnv = "ARGOCD_API_SERVER_REPLICAS"
-const enableGRPCTimeHistogramEnv = "ARGOCD_ENABLE_GRPC_TIME_HISTOGRAM"
 
 // ErrNoSession indicates no auth token was supplied as part of a request
 var ErrNoSession = status.Errorf(codes.Unauthenticated, "no session information")
@@ -135,7 +138,7 @@ func init() {
 	if replicasCount > 0 {
 		maxConcurrentLoginRequestsCount = maxConcurrentLoginRequestsCount / replicasCount
 	}
-	enableGRPCTimeHistogram = os.Getenv(enableGRPCTimeHistogramEnv) != "false"
+	enableGRPCTimeHistogram = os.Getenv(common.EnvEnableGRPCTimeHistogramEnv) == "true"
 }
 
 // ArgoCDServer is the API server for Argo CD
@@ -159,6 +162,7 @@ type ArgoCDServer struct {
 
 type ArgoCDServerOpts struct {
 	DisableAuth         bool
+	EnableGZip          bool
 	Insecure            bool
 	ListenPort          int
 	MetricsPort         int
@@ -187,9 +191,12 @@ func initializeDefaultProject(opts ArgoCDServerOpts) error {
 		},
 	}
 
-	_, err := opts.AppClientset.ArgoprojV1alpha1().AppProjects(opts.Namespace).Create(context.Background(), defaultProj, metav1.CreateOptions{})
-	if apierrors.IsAlreadyExists(err) {
-		return nil
+	_, err := opts.AppClientset.ArgoprojV1alpha1().AppProjects(opts.Namespace).Get(context.Background(), defaultProj.Name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		_, err = opts.AppClientset.ArgoprojV1alpha1().AppProjects(opts.Namespace).Create(context.Background(), defaultProj, metav1.CreateOptions{})
+		if apierrors.IsAlreadyExists(err) {
+			return nil
+		}
 	}
 	return err
 }
@@ -510,7 +517,7 @@ func (a *ArgoCDServer) newGRPCServer() *grpc.Server {
 	)))
 	grpcS := grpc.NewServer(sOpts...)
 	db := db.NewDB(a.Namespace, a.settingsMgr, a.KubeClientset)
-	kubectl := &kube.KubectlCmd{}
+	kubectl := kubeutil.NewKubectl()
 	clusterService := cluster.NewServer(db, a.enf, a.Cache, kubectl)
 	repoService := repository.NewServer(a.RepoClientset, db, a.enf, a.Cache, a.settingsMgr)
 	repoCredsService := repocreds.NewServer(a.RepoClientset, db, a.enf, a.settingsMgr)
@@ -519,9 +526,22 @@ func (a *ArgoCDServer) newGRPCServer() *grpc.Server {
 		loginRateLimiter = session.NewLoginRateLimiter(maxConcurrentLoginRequestsCount)
 	}
 	sessionService := session.NewServer(a.sessionMgr, a, a.policyEnforcer, loginRateLimiter)
-	projectLock := util.NewKeyLock()
-	applicationService := application.NewServer(a.Namespace, a.KubeClientset, a.AppClientset, a.appLister, a.appInformer, a.RepoClientset, a.Cache, kubectl, db, a.enf, projectLock, a.settingsMgr)
-	projectService := project.NewServer(a.Namespace, a.KubeClientset, a.AppClientset, a.enf, projectLock, a.sessionMgr, a.policyEnforcer)
+	projectLock := sync.NewKeyLock()
+	applicationService := application.NewServer(
+		a.Namespace,
+		a.KubeClientset,
+		a.AppClientset,
+		a.appLister,
+		a.appInformer,
+		a.RepoClientset,
+		a.Cache,
+		kubectl,
+		db,
+		a.enf,
+		projectLock,
+		a.settingsMgr,
+		a.projInformer)
+	projectService := project.NewServer(a.Namespace, a.KubeClientset, a.AppClientset, a.enf, projectLock, a.sessionMgr, a.policyEnforcer, a.projInformer, a.settingsMgr)
 	settingsService := settings.NewServer(a.settingsMgr, a, a.DisableAuth)
 	accountService := account.NewServer(a.sessionMgr, a.settingsMgr, a.enf)
 	certificateService := certificate.NewServer(a.RepoClientset, db, a.enf)
@@ -577,11 +597,21 @@ func withRootPath(handler http.Handler, a *ArgoCDServer) http.Handler {
 	mux.Handle("/"+root+"/", http.StripPrefix("/"+root, handler))
 
 	healthz.ServeHealthCheck(mux, func() error {
-		_, err := a.KubeClientset.(*kubernetes.Clientset).ServerVersion()
-		return err
+		return nil
 	})
 
 	return mux
+}
+
+func compressHandler(handler http.Handler) http.Handler {
+	compr := handlers.CompressHandler(handler)
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Accept") == "text/event-stream" {
+			handler.ServeHTTP(writer, request)
+		} else {
+			compr.ServeHTTP(writer, request)
+		}
+	})
 }
 
 // newHTTPServer returns the HTTP server to serve HTTP/HTTPS requests. This is implemented
@@ -594,7 +624,8 @@ func (a *ArgoCDServer) newHTTPServer(ctx context.Context, port int, grpcWebHandl
 		Handler: &handlerSwitcher{
 			handler: mux,
 			urlToHandler: map[string]http.Handler{
-				"/api/badge": badge.NewHandler(a.AppClientset, a.settingsMgr, a.Namespace),
+				"/api/badge":          badge.NewHandler(a.AppClientset, a.settingsMgr, a.Namespace),
+				common.LogoutEndpoint: logout.NewHandler(a.AppClientset, a.settingsMgr, a.sessionMgr, a.ArgoCDServerOpts.RootPath, a.Namespace),
 			},
 			contentTypeToHandler: map[string]http.Handler{
 				"application/grpc-web+proto": grpcWebHandler,
@@ -629,7 +660,13 @@ func (a *ArgoCDServer) newHTTPServer(ctx context.Context, port int, grpcWebHandl
 	gwMuxOpts := runtime.WithMarshalerOption(runtime.MIMEWildcard, new(grpc_util.JSONMarshaler))
 	gwCookieOpts := runtime.WithForwardResponseOption(a.translateGrpcCookieHeader)
 	gwmux := runtime.NewServeMux(gwMuxOpts, gwCookieOpts)
-	mux.Handle("/api/", gwmux)
+
+	var handler http.Handler = gwmux
+	if a.EnableGZip {
+		handler = compressHandler(handler)
+	}
+	mux.Handle("/api/", handler)
+
 	mustRegisterGWHandler(versionpkg.RegisterVersionServiceHandlerFromEndpoint, ctx, gwmux, endpoint, dOpts)
 	mustRegisterGWHandler(clusterpkg.RegisterClusterServiceHandlerFromEndpoint, ctx, gwmux, endpoint, dOpts)
 	mustRegisterGWHandler(applicationpkg.RegisterApplicationServiceHandlerFromEndpoint, ctx, gwmux, endpoint, dOpts)
@@ -645,15 +682,14 @@ func (a *ArgoCDServer) newHTTPServer(ctx context.Context, port int, grpcWebHandl
 	// Swagger UI
 	swagger.ServeSwaggerUI(mux, assets.SwaggerJSON, "/swagger-ui", a.RootPath)
 	healthz.ServeHealthCheck(mux, func() error {
-		_, err := a.KubeClientset.(*kubernetes.Clientset).ServerVersion()
-		return err
+		return nil
 	})
 
 	// Dex reverse proxy and client app and OAuth2 login/callback
 	a.registerDexHandlers(mux)
 
 	// Webhook handler for git events
-	acdWebhookHandler := webhook.NewHandler(a.Namespace, a.AppClientset, a.settings)
+	acdWebhookHandler := webhook.NewHandler(a.Namespace, a.AppClientset, a.settings, a.settingsMgr, repocache.NewCache(a.Cache.GetCache(), 24*time.Hour))
 	mux.HandleFunc("/api/webhook", acdWebhookHandler.Handler)
 
 	// Serve cli binaries directly from API server

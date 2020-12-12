@@ -46,6 +46,9 @@ import (
 // +genclient:noStatus
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:resource:path=applications,shortName=app;apps
+// +kubebuilder:printcolumn:name="Sync Status",type=string,JSONPath=`.status.sync.status`
+// +kubebuilder:printcolumn:name="Health Status",type=string,JSONPath=`.status.health.status`
+// +kubebuilder:printcolumn:name="Revision",type=string,JSONPath=`.status.sync.revision`,priority=10
 type Application struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata" protobuf:"bytes,1,opt,name=metadata"`
@@ -146,8 +149,31 @@ type ApplicationSource struct {
 	Chart string `json:"chart,omitempty" protobuf:"bytes,12,opt,name=chart"`
 }
 
+// AllowsConcurrentProcessing returns true if given application source can be processed concurrently
+func (a *ApplicationSource) AllowsConcurrentProcessing() bool {
+	switch {
+	// Kustomize with parameters requires changing kustomization.yaml file
+	case a.Kustomize != nil:
+		return a.Kustomize.AllowsConcurrentProcessing()
+	// Kustomize with parameters requires changing params.libsonnet file
+	case a.Ksonnet != nil:
+		return a.Ksonnet.AllowsConcurrentProcessing()
+	}
+	return true
+}
+
 func (a *ApplicationSource) IsHelm() bool {
 	return a.Chart != ""
+}
+
+func (a *ApplicationSource) IsHelmOci() bool {
+	if a.Chart == "" {
+		return false
+	}
+	if _, _, ok := helm.IsHelmOci(a.Chart); ok {
+		return true
+	}
+	return false
 }
 
 func (a *ApplicationSource) IsZero() bool {
@@ -314,6 +340,15 @@ type ApplicationSourceKustomize struct {
 	CommonLabels map[string]string `json:"commonLabels,omitempty" protobuf:"bytes,4,opt,name=commonLabels"`
 	// Version contains optional Kustomize version
 	Version string `json:"version,omitempty" protobuf:"bytes,5,opt,name=version"`
+	// CommonAnnotations adds additional kustomize commonAnnotations
+	CommonAnnotations map[string]string `json:"commonAnnotations,omitempty" protobuf:"bytes,6,opt,name=commonAnnotations"`
+}
+
+func (k *ApplicationSourceKustomize) AllowsConcurrentProcessing() bool {
+	return len(k.Images) == 0 &&
+		len(k.CommonLabels) == 0 &&
+		k.NamePrefix == "" &&
+		k.NameSuffix == ""
 }
 
 func (k *ApplicationSourceKustomize) IsZero() bool {
@@ -322,7 +357,8 @@ func (k *ApplicationSourceKustomize) IsZero() bool {
 			k.NameSuffix == "" &&
 			k.Version == "" &&
 			len(k.Images) == 0 &&
-			len(k.CommonLabels) == 0
+			len(k.CommonLabels) == 0 &&
+			len(k.CommonAnnotations) == 0
 }
 
 // either updates or adds the images
@@ -380,6 +416,10 @@ type KsonnetParameter struct {
 	Value     string `json:"value" protobuf:"bytes,3,opt,name=value"`
 }
 
+func (k *ApplicationSourceKsonnet) AllowsConcurrentProcessing() bool {
+	return len(k.Parameters) == 0
+}
+
 func (k *ApplicationSourceKsonnet) IsZero() bool {
 	return k == nil || k.Environment == "" && len(k.Parameters) == 0
 }
@@ -387,6 +427,7 @@ func (k *ApplicationSourceKsonnet) IsZero() bool {
 type ApplicationSourceDirectory struct {
 	Recurse bool                     `json:"recurse,omitempty" protobuf:"bytes,1,opt,name=recurse"`
 	Jsonnet ApplicationSourceJsonnet `json:"jsonnet,omitempty" protobuf:"bytes,2,opt,name=jsonnet"`
+	Exclude string                   `json:"exclude,omitempty" protobuf:"bytes,3,opt,name=exclude"`
 }
 
 func (d *ApplicationSourceDirectory) IsZero() bool {
@@ -427,6 +468,7 @@ type ApplicationStatus struct {
 	ReconciledAt   *metav1.Time    `json:"reconciledAt,omitempty" protobuf:"bytes,6,opt,name=reconciledAt"`
 	OperationState *OperationState `json:"operationState,omitempty" protobuf:"bytes,7,opt,name=operationState"`
 	// ObservedAt indicates when the application state was updated without querying latest git state
+	// Deprecated: controller no longer updates ObservedAt field
 	ObservedAt *metav1.Time          `json:"observedAt,omitempty" protobuf:"bytes,8,opt,name=observedAt"`
 	SourceType ApplicationSourceType `json:"sourceType,omitempty" protobuf:"bytes,9,opt,name=sourceType"`
 	Summary    ApplicationSummary    `json:"summary,omitempty" protobuf:"bytes,10,opt,name=summary"`
@@ -655,11 +697,13 @@ type SyncPolicyAutomated struct {
 	Prune bool `json:"prune,omitempty" protobuf:"bytes,1,opt,name=prune"`
 	// SelfHeal enables auto-syncing if  (default: false)
 	SelfHeal bool `json:"selfHeal,omitempty" protobuf:"bytes,2,opt,name=selfHeal"`
+	// AllowEmpty allows apps have zero live resources (default: false)
+	AllowEmpty bool `json:"allowEmpty,omitempty" protobuf:"bytes,3,opt,name=allowEmpty"`
 }
 
 // SyncStrategy controls the manner in which a sync is performed
 type SyncStrategy struct {
-	// Apply wil perform a `kubectl apply` to perform the sync.
+	// Apply will perform a `kubectl apply` to perform the sync.
 	Apply *SyncStrategyApply `json:"apply,omitempty" protobuf:"bytes,1,opt,name=apply"`
 	// Hook will submit any referenced resources to perform the sync. This is the default strategy
 	Hook *SyncStrategyHook `json:"hook,omitempty" protobuf:"bytes,2,opt,name=hook"`
@@ -1033,6 +1077,8 @@ type ConnectionState struct {
 
 // Cluster is the definition of a cluster resource
 type Cluster struct {
+	// ID is an internal field cluster identifier. Not exposed via API.
+	ID string `json:"-"`
 	// Server is the API server URL of the Kubernetes cluster
 	Server string `json:"server" protobuf:"bytes,1,opt,name=server"`
 	// Name of the cluster. If omitted, will use the server address
@@ -1051,6 +1097,8 @@ type Cluster struct {
 	RefreshRequestedAt *metav1.Time `json:"refreshRequestedAt,omitempty" protobuf:"bytes,7,opt,name=refreshRequestedAt"`
 	// Holds information about cluster cache
 	Info ClusterInfo `json:"info,omitempty" protobuf:"bytes,8,opt,name=info"`
+	// Shard contains optional shard number. Calculated on the fly by the application controller if not specified.
+	Shard *int64 `json:"shard,omitempty" protobuf:"bytes,9,opt,name=shard"`
 }
 
 func (c *Cluster) Equals(other *Cluster) bool {
@@ -1061,6 +1109,17 @@ func (c *Cluster) Equals(other *Cluster) bool {
 		return false
 	}
 	if strings.Join(c.Namespaces, ",") != strings.Join(other.Namespaces, ",") {
+		return false
+	}
+	var shard int64 = -1
+	if c.Shard != nil {
+		shard = *c.Shard
+	}
+	var otherShard int64 = -1
+	if other.Shard != nil {
+		otherShard = *other.Shard
+	}
+	if shard != otherShard {
 		return false
 	}
 	return reflect.DeepEqual(c.Config, other.Config)
@@ -1097,6 +1156,25 @@ type AWSAuthConfig struct {
 	RoleARN string `json:"roleARN,omitempty" protobuf:"bytes,2,opt,name=roleARN"`
 }
 
+// ExecProviderConfig is config used to call an external command to perform cluster authentication
+// See: https://godoc.org/k8s.io/client-go/tools/clientcmd/api#ExecConfig
+type ExecProviderConfig struct {
+	// Command to execute
+	Command string `json:"command,omitempty" protobuf:"bytes,1,opt,name=command"`
+
+	// Arguments to pass to the command when executing it
+	Args []string `json:"args,omitempty" protobuf:"bytes,2,rep,name=args"`
+
+	// Env defines additional environment variables to expose to the process
+	Env map[string]string `json:"env,omitempty" protobuf:"bytes,3,opt,name=env"`
+
+	// Preferred input version of the ExecInfo
+	APIVersion string `json:"apiVersion,omitempty" protobuf:"bytes,4,opt,name=apiVersion"`
+
+	// This text is shown to the user when the executable doesn't seem to be present
+	InstallHint string `json:"installHint,omitempty" protobuf:"bytes,5,opt,name=installHint"`
+}
+
 // ClusterConfig is the configuration attributes. This structure is subset of the go-client
 // rest.Config with annotations added for marshalling.
 type ClusterConfig struct {
@@ -1114,6 +1192,9 @@ type ClusterConfig struct {
 
 	// AWSAuthConfig contains IAM authentication configuration
 	AWSAuthConfig *AWSAuthConfig `json:"awsAuthConfig,omitempty" protobuf:"bytes,5,opt,name=awsAuthConfig"`
+
+	// ExecProviderConfig contains configuration for an exec provider
+	ExecProviderConfig *ExecProviderConfig `json:"execProviderConfig,omitempty" protobuf:"bytes,6,opt,name=execProviderConfig"`
 }
 
 // TLSClientConfig contains settings to enable transport layer security
@@ -1258,6 +1339,8 @@ type Repository struct {
 	Name string `json:"name,omitempty" protobuf:"bytes,12,opt,name=name"`
 	// Whether credentials were inherited from a credential set
 	InheritedCreds bool `json:"inheritedCreds,omitempty" protobuf:"bytes,13,opt,name=inheritedCreds"`
+	// Whether helm-oci support should be enabled for this repo
+	EnableOCI bool `json:"enableOCI,omitempty" protobuf:"bytes,14,opt,name=enableOCI"`
 }
 
 // IsInsecure returns true if receiver has been configured to skip server verification
@@ -1843,15 +1926,23 @@ func (s *SyncWindows) HasWindows() bool {
 }
 
 func (s *SyncWindows) Active() *SyncWindows {
+	return s.active(time.Now())
+}
+
+func (s *SyncWindows) active(currentTime time.Time) *SyncWindows {
+
+	// If SyncWindows.Active() is called outside of a UTC locale, it should be
+	// first converted to UTC before we scan through the SyncWindows.
+	currentTime = currentTime.In(time.UTC)
+
 	if s.HasWindows() {
 		var active SyncWindows
 		specParser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 		for _, w := range *s {
 			schedule, _ := specParser.Parse(w.Schedule)
 			duration, _ := time.ParseDuration(w.Duration)
-			now := time.Now()
-			nextWindow := schedule.Next(now.Add(-duration))
-			if nextWindow.Before(now) {
+			nextWindow := schedule.Next(currentTime.Add(-duration))
+			if nextWindow.Before(currentTime) {
 				active = append(active, w)
 			}
 		}
@@ -1863,6 +1954,15 @@ func (s *SyncWindows) Active() *SyncWindows {
 }
 
 func (s *SyncWindows) InactiveAllows() *SyncWindows {
+	return s.inactiveAllows(time.Now())
+}
+
+func (s *SyncWindows) inactiveAllows(currentTime time.Time) *SyncWindows {
+
+	// If SyncWindows.InactiveAllows() is called outside of a UTC locale, it should be
+	// first converted to UTC before we scan through the SyncWindows.
+	currentTime = currentTime.In(time.UTC)
+
 	if s.HasWindows() {
 		var inactive SyncWindows
 		specParser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
@@ -1870,9 +1970,8 @@ func (s *SyncWindows) InactiveAllows() *SyncWindows {
 			if w.Kind == "allow" {
 				schedule, sErr := specParser.Parse(w.Schedule)
 				duration, dErr := time.ParseDuration(w.Duration)
-				now := time.Now()
-				nextWindow := schedule.Next(now.Add(-duration))
-				if !nextWindow.Before(now) && sErr == nil && dErr == nil {
+				nextWindow := schedule.Next(currentTime.Add(-duration))
+				if !nextWindow.Before(currentTime) && sErr == nil && dErr == nil {
 					inactive = append(inactive, w)
 				}
 			}
@@ -2042,12 +2141,21 @@ func (w *SyncWindows) manualEnabled() bool {
 }
 
 func (w SyncWindow) Active() bool {
+	return w.active(time.Now())
+}
+
+func (w SyncWindow) active(currentTime time.Time) bool {
+
+	// If SyncWindow.Active() is called outside of a UTC locale, it should be
+	// first converted to UTC before search
+	currentTime = currentTime.UTC()
+
 	specParser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	schedule, _ := specParser.Parse(w.Schedule)
 	duration, _ := time.ParseDuration(w.Duration)
-	now := time.Now()
-	nextWindow := schedule.Next(now.Add(-duration))
-	return nextWindow.Before(now)
+
+	nextWindow := schedule.Next(currentTime.Add(-duration))
+	return nextWindow.Before(currentTime)
 }
 
 func (w *SyncWindow) Update(s string, d string, a []string, n []string, c []string) error {
@@ -2290,6 +2398,17 @@ func (source *ApplicationSource) ExplicitType() (*ApplicationSourceType, error) 
 
 // Equals compares two instances of ApplicationDestination and return true if instances are equal.
 func (dest ApplicationDestination) Equals(other ApplicationDestination) bool {
+	// ignore destination cluster name and isServerInferred fields during comparison
+	// since server URL is inferred from cluster name
+	if dest.isServerInferred {
+		dest.Server = ""
+		dest.isServerInferred = false
+	}
+
+	if other.isServerInferred {
+		other.Server = ""
+		other.isServerInferred = false
+	}
 	return reflect.DeepEqual(dest, other)
 }
 
@@ -2479,6 +2598,27 @@ func (c *Cluster) RawRestConfig() *rest.Config {
 					Args:       args,
 				},
 			}
+		} else if c.Config.ExecProviderConfig != nil {
+			var env []api.ExecEnvVar
+			if c.Config.ExecProviderConfig.Env != nil {
+				for key, value := range c.Config.ExecProviderConfig.Env {
+					env = append(env, api.ExecEnvVar{
+						Name:  key,
+						Value: value,
+					})
+				}
+			}
+			config = &rest.Config{
+				Host:            c.Server,
+				TLSClientConfig: tlsClientConfig,
+				ExecProvider: &api.ExecConfig{
+					APIVersion:  c.Config.ExecProviderConfig.APIVersion,
+					Command:     c.Config.ExecProviderConfig.Command,
+					Args:        c.Config.ExecProviderConfig.Args,
+					Env:         env,
+					InstallHint: c.Config.ExecProviderConfig.InstallHint,
+				},
+			}
 		} else {
 			config = &rest.Config{
 				Host:            c.Server,
@@ -2605,7 +2745,7 @@ func jwtTokensCombine(tokens1 []JWTToken, tokens2 []JWTToken) []JWTToken {
 		tokensMap[token.ID] = token
 	}
 
-	tokens := []JWTToken{}
+	var tokens []JWTToken
 	for _, v := range tokensMap {
 		tokens = append(tokens, v)
 	}

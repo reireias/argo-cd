@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"sync"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/argoproj/gitops-engine/pkg/health"
 	"github.com/argoproj/gitops-engine/pkg/utils/kube"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/semaphore"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -21,6 +23,7 @@ import (
 	appv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	"github.com/argoproj/argo-cd/util/argo"
 	"github.com/argoproj/argo-cd/util/db"
+	logutils "github.com/argoproj/argo-cd/util/log"
 	"github.com/argoproj/argo-cd/util/lua"
 	"github.com/argoproj/argo-cd/util/settings"
 )
@@ -63,7 +66,8 @@ func NewLiveStateCache(
 	settingsMgr *settings.SettingsManager,
 	kubectl kube.Kubectl,
 	metricsServer *metrics.MetricsServer,
-	onObjectUpdated ObjectUpdatedHandler) LiveStateCache {
+	onObjectUpdated ObjectUpdatedHandler,
+	clusterFilter func(cluster *appv1.Cluster) bool) LiveStateCache {
 
 	return &liveStateCache{
 		appInformer:     appInformer,
@@ -73,6 +77,9 @@ func NewLiveStateCache(
 		kubectl:         kubectl,
 		settingsMgr:     settingsMgr,
 		metricsServer:   metricsServer,
+		// The default limit of 50 is chosen based on experiments.
+		listSemaphore: semaphore.NewWeighted(50),
+		clusterFilter: clusterFilter,
 	}
 }
 
@@ -88,6 +95,11 @@ type liveStateCache struct {
 	kubectl         kube.Kubectl
 	settingsMgr     *settings.SettingsManager
 	metricsServer   *metrics.MetricsServer
+	clusterFilter   func(cluster *appv1.Cluster) bool
+
+	// listSemaphore is used to limit the number of concurrent memory consuming operations on the
+	// k8s list queries results across all clusters to avoid memory spikes during cache initialization.
+	listSemaphore *semaphore.Weighted
 
 	clusters      map[string]clustercache.ClusterCache
 	cacheSettings cacheSettings
@@ -231,7 +243,12 @@ func (c *liveStateCache) getCluster(server string) (clustercache.ClusterCache, e
 		return nil, err
 	}
 
+	if !c.canHandleCluster(cluster) {
+		return nil, fmt.Errorf("controller is configured to ignore cluster %s", cluster.Server)
+	}
+
 	clusterCache = clustercache.NewClusterCache(cluster.RESTConfig(),
+		clustercache.SetListSemaphore(c.listSemaphore),
 		clustercache.SetResyncTimeout(common.K8SClusterResyncDuration),
 		clustercache.SetSettings(cacheSettings.clusterSettings),
 		clustercache.SetNamespaces(cluster.Namespaces),
@@ -248,6 +265,7 @@ func (c *liveStateCache) getCluster(server string) (clustercache.ClusterCache, e
 			// want the full resource to be available in our cache (to diff), so we store all CRDs
 			return res, res.AppName != "" || un.GroupVersionKind().Kind == kube.CustomResourceDefinitionKind
 		}),
+		clustercache.SetLogr(logutils.NewLogrusLogger(log.WithField("server", cluster.Server))),
 	)
 
 	_ = clusterCache.OnResourceUpdated(func(newRes *clustercache.Resource, oldRes *clustercache.Resource, namespaceResources map[kube.ResourceKey]*clustercache.Resource) {
@@ -418,7 +436,7 @@ func (c *liveStateCache) Init() error {
 func (c *liveStateCache) Run(ctx context.Context) error {
 	go c.watchSettings(ctx)
 
-	kube.RetryUntilSucceed(ctx, clustercache.ClusterRetryTimeout, "watch clusters", func() error {
+	kube.RetryUntilSucceed(ctx, clustercache.ClusterRetryTimeout, "watch clusters", logutils.NewLogrusLogger(log.New()), func() error {
 		return c.db.WatchClusters(ctx, c.handleAddEvent, c.handleModEvent, c.handleDeleteEvent)
 	})
 
@@ -427,7 +445,19 @@ func (c *liveStateCache) Run(ctx context.Context) error {
 	return nil
 }
 
+func (c *liveStateCache) canHandleCluster(cluster *appv1.Cluster) bool {
+	if c.clusterFilter == nil {
+		return true
+	}
+	return c.clusterFilter(cluster)
+}
+
 func (c *liveStateCache) handleAddEvent(cluster *appv1.Cluster) {
+	if !c.canHandleCluster(cluster) {
+		log.Infof("Ignoring cluster %s", cluster.Server)
+		return
+	}
+
 	c.lock.Lock()
 	_, ok := c.clusters[cluster.Server]
 	c.lock.Unlock()
@@ -446,6 +476,14 @@ func (c *liveStateCache) handleModEvent(oldCluster *appv1.Cluster, newCluster *a
 	cluster, ok := c.clusters[newCluster.Server]
 	c.lock.Unlock()
 	if ok {
+		if !c.canHandleCluster(newCluster) {
+			cluster.Invalidate()
+			c.lock.Lock()
+			delete(c.clusters, newCluster.Server)
+			c.lock.Unlock()
+			return
+		}
+
 		var updateSettings []clustercache.UpdateSettingsFunc
 		if !reflect.DeepEqual(oldCluster.Config, newCluster.Config) {
 			updateSettings = append(updateSettings, clustercache.SetConfig(newCluster.RESTConfig()))

@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"io/ioutil"
 
-	"github.com/argoproj/gitops-engine/pkg/utils/errors"
 	log "github.com/sirupsen/logrus"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	. "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	"github.com/argoproj/argo-cd/test/e2e/fixture"
+	"github.com/argoproj/argo-cd/util/errors"
 	"github.com/argoproj/argo-cd/util/grpc"
 )
 
@@ -46,6 +46,12 @@ func (a *Actions) DeleteFile(file string) *Actions {
 	return a
 }
 
+func (a *Actions) WriteFile(fileName, fileContents string) *Actions {
+	a.context.t.Helper()
+	fixture.WriteFile(a.context.path+"/"+fileName, fileContents)
+	return a
+}
+
 func (a *Actions) AddFile(fileName, fileContents string) *Actions {
 	a.context.t.Helper()
 	fixture.AddFile(a.context.path+"/"+fileName, fileContents)
@@ -58,7 +64,26 @@ func (a *Actions) AddSignedFile(fileName, fileContents string) *Actions {
 	return a
 }
 
-func (a *Actions) CreateFromFile(handler func(app *Application)) *Actions {
+func (a *Actions) CreateFromPartialFile(data string, flags ...string) *Actions {
+	a.context.t.Helper()
+	tmpFile, err := ioutil.TempFile("", "")
+	errors.CheckError(err)
+	_, err = tmpFile.Write([]byte(data))
+	errors.CheckError(err)
+
+	args := append([]string{
+		"app", "create",
+		"-f", tmpFile.Name(),
+		"--name", a.context.name,
+		"--repo", fixture.RepoURL(a.context.repoURLType),
+		"--dest-server", a.context.destServer,
+		"--dest-namespace", fixture.DeploymentNamespace(),
+	}, flags...)
+
+	a.runCli(args...)
+	return a
+}
+func (a *Actions) CreateFromFile(handler func(app *Application), flags ...string) *Actions {
 	a.context.t.Helper()
 	app := &Application{
 		ObjectMeta: v1.ObjectMeta{
@@ -108,7 +133,12 @@ func (a *Actions) CreateFromFile(handler func(app *Application)) *Actions {
 	_, err = tmpFile.Write(data)
 	errors.CheckError(err)
 
-	a.runCli("app", "create", "-f", tmpFile.Name())
+	args := append([]string{
+		"app", "create",
+		"-f", tmpFile.Name(),
+	}, flags...)
+
+	a.runCli(args...)
 	return a
 }
 

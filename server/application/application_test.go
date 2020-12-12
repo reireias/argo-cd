@@ -7,8 +7,8 @@ import (
 	"time"
 
 	synccommon "github.com/argoproj/gitops-engine/pkg/sync/common"
-	"github.com/argoproj/gitops-engine/pkg/utils/errors"
 	"github.com/argoproj/gitops-engine/pkg/utils/kube/kubetest"
+	"github.com/argoproj/pkg/sync"
 	"github.com/dgrijalva/jwt-go"
 	"github.com/ghodss/yaml"
 	"github.com/stretchr/testify/assert"
@@ -34,10 +34,10 @@ import (
 	"github.com/argoproj/argo-cd/reposerver/apiclient/mocks"
 	"github.com/argoproj/argo-cd/server/rbacpolicy"
 	"github.com/argoproj/argo-cd/test"
-	"github.com/argoproj/argo-cd/util"
 	"github.com/argoproj/argo-cd/util/assets"
 	"github.com/argoproj/argo-cd/util/cache"
 	"github.com/argoproj/argo-cd/util/db"
+	"github.com/argoproj/argo-cd/util/errors"
 	"github.com/argoproj/argo-cd/util/rbac"
 	"github.com/argoproj/argo-cd/util/settings"
 )
@@ -152,7 +152,13 @@ func newTestAppServer(objects ...runtime.Object) *Server {
 	//ctx, cancel := context.WithCancel(context.Background())
 	go appInformer.Run(ctx.Done())
 	if !k8scache.WaitForCacheSync(ctx.Done(), appInformer.HasSynced) {
-		panic("Timed out waiting forfff caches to sync")
+		panic("Timed out waiting for caches to sync")
+	}
+
+	projInformer := factory.Argoproj().V1alpha1().AppProjects().Informer()
+	go projInformer.Run(ctx.Done())
+	if !k8scache.WaitForCacheSync(ctx.Done(), projInformer.HasSynced) {
+		panic("Timed out waiting for caches to sync")
 	}
 
 	server := NewServer(
@@ -166,8 +172,9 @@ func newTestAppServer(objects ...runtime.Object) *Server {
 		&kubetest.MockKubectlCmd{},
 		db,
 		enforcer,
-		util.NewKeyLock(),
+		sync.NewKeyLock(),
 		settingsMgr,
+		projInformer,
 	)
 	return server.(*Server)
 }
@@ -208,12 +215,36 @@ spec:
     name: fake-cluster
 `
 
+const fakeAppWithAnnotations = `
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: test-app
+  namespace: default
+  annotations:
+    test.annotation: test
+spec:
+  source:
+    path: some/path
+    repoURL: https://github.com/argoproj/argocd-example-apps.git
+    targetRevision: HEAD
+    ksonnet:
+      environment: default
+  destination:
+    namespace: ` + test.FakeDestNamespace + `
+    server: https://cluster-api.com
+`
+
 func newTestAppWithDestName(opts ...func(app *appsv1.Application)) *appsv1.Application {
 	return createTestApp(fakeAppWithDestName, opts...)
 }
 
 func newTestApp(opts ...func(app *appsv1.Application)) *appsv1.Application {
 	return createTestApp(fakeApp, opts...)
+}
+
+func newTestAppWithAnnotations(opts ...func(app *appsv1.Application)) *appsv1.Application {
+	return createTestApp(fakeAppWithAnnotations, opts...)
 }
 
 func createTestApp(testApp string, opts ...func(app *appsv1.Application)) *appsv1.Application {
@@ -492,7 +523,7 @@ p, admin, applications, update, my-proj/test-app, allow
 }
 
 func TestAppJsonPatch(t *testing.T) {
-	testApp := newTestApp()
+	testApp := newTestAppWithAnnotations()
 	ctx := context.Background()
 	// nolint:staticcheck
 	ctx = context.WithValue(ctx, "claims", &jwt.StandardClaims{Subject: "admin"})
@@ -510,6 +541,10 @@ func TestAppJsonPatch(t *testing.T) {
 	app, err = appServer.Patch(ctx, &application.ApplicationPatchRequest{Name: &testApp.Name, Patch: `[{"op": "replace", "path": "/spec/source/path", "value": "foo"}]`})
 	assert.NoError(t, err)
 	assert.Equal(t, "foo", app.Spec.Source.Path)
+
+	app, err = appServer.Patch(ctx, &application.ApplicationPatchRequest{Name: &testApp.Name, Patch: `[{"op": "remove", "path": "/metadata/annotations/test.annotation"}]`})
+	assert.NoError(t, err)
+	assert.NotContains(t, app.Annotations, "test.annotation")
 }
 
 func TestAppMergePatch(t *testing.T) {
@@ -558,6 +593,7 @@ func TestServer_GetApplicationSyncWindowsState(t *testing.T) {
 
 func TestGetCachedAppState(t *testing.T) {
 	testApp := newTestApp()
+	testApp.ObjectMeta.ResourceVersion = "1"
 	testApp.Spec.Project = "none"
 	appServer := newTestAppServer(testApp)
 
@@ -575,16 +611,24 @@ func TestGetCachedAppState(t *testing.T) {
 		patched := false
 		watcher := watch.NewFakeWithChanSize(1, true)
 
-		fakeClientSet.ReactionChain = nil
-		fakeClientSet.WatchReactionChain = nil
-		fakeClientSet.AddReactor("patch", "applications", func(action kubetesting.Action) (handled bool, ret runtime.Object, err error) {
-			patched = true
-			watcher.Modify(testApp)
-			return true, nil, nil
-		})
-		fakeClientSet.AddWatchReactor("applications", func(action kubetesting.Action) (handled bool, ret watch.Interface, err error) {
-			return true, watcher, nil
-		})
+		// Configure fakeClientSet within lock, before requesting cached app state, to avoid data race
+		{
+			fakeClientSet.Lock()
+			fakeClientSet.ReactionChain = nil
+			fakeClientSet.WatchReactionChain = nil
+			fakeClientSet.AddReactor("patch", "applications", func(action kubetesting.Action) (handled bool, ret runtime.Object, err error) {
+				patched = true
+				updated := testApp.DeepCopy()
+				updated.ResourceVersion = "2"
+				appServer.appBroadcaster.OnUpdate(testApp, updated)
+				return true, testApp, nil
+			})
+			fakeClientSet.AddWatchReactor("applications", func(action kubetesting.Action) (handled bool, ret watch.Interface, err error) {
+				return true, watcher, nil
+			})
+			fakeClientSet.Unlock()
+		}
+
 		err := appServer.getCachedAppState(context.Background(), testApp, func() error {
 			res := cache.ErrCacheMiss
 			if retryCount == 1 {
@@ -605,4 +649,35 @@ func TestGetCachedAppState(t *testing.T) {
 		})
 		assert.Equal(t, randomError, err)
 	})
+}
+
+func TestSplitStatusPatch(t *testing.T) {
+	specPatch := `{"spec":{"aaa":"bbb"}}`
+	statusPatch := `{"status":{"ccc":"ddd"}}`
+	{
+		nonStatus, status, err := splitStatusPatch([]byte(specPatch))
+		assert.NoError(t, err)
+		assert.Equal(t, specPatch, string(nonStatus))
+		assert.Nil(t, status)
+	}
+	{
+		nonStatus, status, err := splitStatusPatch([]byte(statusPatch))
+		assert.NoError(t, err)
+		assert.Nil(t, nonStatus)
+		assert.Equal(t, statusPatch, string(status))
+	}
+	{
+		bothPatch := `{"spec":{"aaa":"bbb"},"status":{"ccc":"ddd"}}`
+		nonStatus, status, err := splitStatusPatch([]byte(bothPatch))
+		assert.NoError(t, err)
+		assert.Equal(t, specPatch, string(nonStatus))
+		assert.Equal(t, statusPatch, string(status))
+	}
+	{
+		otherFields := `{"operation":{"eee":"fff"},"spec":{"aaa":"bbb"},"status":{"ccc":"ddd"}}`
+		nonStatus, status, err := splitStatusPatch([]byte(otherFields))
+		assert.NoError(t, err)
+		assert.Equal(t, `{"operation":{"eee":"fff"},"spec":{"aaa":"bbb"}}`, string(nonStatus))
+		assert.Equal(t, statusPatch, string(status))
+	}
 }
