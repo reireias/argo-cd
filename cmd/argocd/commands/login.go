@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"html"
 	"net/http"
 	"os"
 	"strconv"
@@ -12,7 +13,7 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc"
-	"github.com/dgrijalva/jwt-go"
+	"github.com/dgrijalva/jwt-go/v4"
 	log "github.com/sirupsen/logrus"
 	"github.com/skratchdot/open-golang/open"
 	"github.com/spf13/cobra"
@@ -25,6 +26,7 @@ import (
 	"github.com/argoproj/argo-cd/util/errors"
 	grpc_util "github.com/argoproj/argo-cd/util/grpc"
 	"github.com/argoproj/argo-cd/util/io"
+	jwtutil "github.com/argoproj/argo-cd/util/jwt"
 	"github.com/argoproj/argo-cd/util/localconfig"
 	oidcutil "github.com/argoproj/argo-cd/util/oidc"
 	"github.com/argoproj/argo-cd/util/rand"
@@ -113,7 +115,7 @@ func NewLoginCommand(globalClientOpts *argocdclient.ClientOptions) *cobra.Comman
 			}
 
 			parser := &jwt.Parser{
-				SkipClaimsValidation: true,
+				ValidationHelper: jwt.NewValidationHelper(jwt.WithoutClaimsValidation(), jwt.WithoutAudienceValidation()),
 			}
 			claims := jwt.MapClaims{}
 			_, _, err := parser.ParseUnverified(tokenString, &claims)
@@ -161,13 +163,13 @@ func NewLoginCommand(globalClientOpts *argocdclient.ClientOptions) *cobra.Comman
 }
 
 func userDisplayName(claims jwt.MapClaims) string {
-	if email, ok := claims["email"]; ok && email != nil {
-		return email.(string)
+	if email := jwtutil.StringField(claims, "email"); email != "" {
+		return email
 	}
-	if name, ok := claims["name"]; ok && name != nil {
-		return name.(string)
+	if name := jwtutil.StringField(claims, "name"); name != "" {
+		return name
 	}
-	return claims["sub"].(string)
+	return jwtutil.StringField(claims, "sub")
 }
 
 // oauth2Login opens a browser, runs a temporary HTTP server to delegate OAuth2 login flow and
@@ -190,7 +192,7 @@ func oauth2Login(ctx context.Context, port int, oidcSettings *settingspkg.OIDCCo
 	var refreshToken string
 
 	handleErr := func(w http.ResponseWriter, errMsg string) {
-		http.Error(w, errMsg, http.StatusBadRequest)
+		http.Error(w, html.EscapeString(errMsg), http.StatusBadRequest)
 		completionChan <- errMsg
 	}
 
@@ -205,7 +207,7 @@ func oauth2Login(ctx context.Context, port int, oidcSettings *settingspkg.OIDCCo
 		log.Debugf("Callback: %s", r.URL)
 
 		if formErr := r.FormValue("error"); formErr != "" {
-			handleErr(w, formErr+": "+r.FormValue("error_description"))
+			handleErr(w, fmt.Sprintf("%s: %s", formErr, r.FormValue("error_description")))
 			return
 		}
 

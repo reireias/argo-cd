@@ -899,6 +899,10 @@ func (s *Server) PatchResource(ctx context.Context, q *application.ApplicationRe
 
 	manifest, err := s.kubectl.PatchResource(ctx, config, res.GroupKindVersion(), res.Name, res.Namespace, types.PatchType(q.PatchType), []byte(q.Patch))
 	if err != nil {
+		// don't expose real error for secrets since it might contain secret data
+		if res.Kind == kube.SecretKind && res.Group == "" {
+			return nil, fmt.Errorf("failed to patch Secret %s/%s", res.Namespace, res.Name)
+		}
 		return nil, err
 	}
 	manifest, err = replaceSecretValues(manifest)
@@ -1293,7 +1297,7 @@ func (s *Server) resolveRevision(ctx context.Context, app *appv1.Application, sy
 		if helm.IsVersion(ambiguousRevision) {
 			return ambiguousRevision, ambiguousRevision, nil
 		}
-		client := helm.NewClient(repo.Repo, repo.GetHelmCreds(), repo.EnableOCI)
+		client := helm.NewClient(repo.Repo, repo.GetHelmCreds(), repo.EnableOCI || app.Spec.Source.IsHelmOci())
 		index, err := client.GetIndex()
 		if err != nil {
 			return "", "", err

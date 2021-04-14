@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc"
-	"github.com/dgrijalva/jwt-go"
+	"github.com/dgrijalva/jwt-go/v4"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
 	"google.golang.org/grpc"
@@ -328,14 +328,14 @@ func (c *client) refreshAuthToken(localCfg *localconfig.LocalConfig, ctxName, co
 		return err
 	}
 	parser := &jwt.Parser{
-		SkipClaimsValidation: true,
+		ValidationHelper: jwt.NewValidationHelper(jwt.WithoutClaimsValidation(), jwt.WithoutAudienceValidation()),
 	}
 	var claims jwt.StandardClaims
 	_, _, err = parser.ParseUnverified(configCtx.User.AuthToken, &claims)
 	if err != nil {
 		return err
 	}
-	if claims.Valid() == nil {
+	if claims.Valid(parser.ValidationHelper) == nil {
 		// token is still valid
 		return nil
 	}
